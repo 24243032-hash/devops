@@ -1,0 +1,114 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-frontend
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/backend/requirements-dev.txt
+      - run: pip install -r app/backend/requirements-dev.txt
+      - run: pytest app/backend/tests -v
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sonar:
+    # Optional: set repo variable ENABLE_SONAR=true and secrets SONAR_TOKEN
+    if: ${{ vars.ENABLE_SONAR == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: SonarSource/sonarcloud-github-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  build-scan-push:
+    needs: [test, secret-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: vars
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build backend image
+        run: docker build -t $BACKEND_IMAGE:${{ steps.vars.outputs.tag }} app/backend
+      - name: Build frontend image
+        run: docker build -t $FRONTEND_IMAGE:${{ steps.vars.outputs.tag }} app/frontend
+
+      - name: Trivy scan (backend)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.BACKEND_IMAGE }}:${{ steps.vars.outputs.tag }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Trivy scan (frontend)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.FRONTEND_IMAGE }}:${{ steps.vars.outputs.tag }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Login to Docker Hub
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push images
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          docker push $BACKEND_IMAGE:${{ steps.vars.outputs.tag }}
+          docker push $FRONTEND_IMAGE:${{ steps.vars.outputs.tag }}
+
+  update-manifest:
+    # GitOps step: bump image tag in Git, ArgoCD does the deploy
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update Helm values
+        run: |
+          TAG=${{ needs.build-scan-push.outputs.tag }}
+          sed -i "s|^\(\s*tag:\s*\).*# backend-tag|\1\"$TAG\" # backend-tag|" helm/devops-app/values.yaml
+          sed -i "s|^\(\s*tag:\s*\).*# frontend-tag|\1\"$TAG\" # frontend-tag|" helm/devops-app/values.yaml
+          sed -i "s|repository:.*# backend-repo|repository: ${{ secrets.DOCKERHUB_USERNAME }}/devops-backend # backend-repo|" helm/devops-app/values.yaml
+          sed -i "s|repository:.*# frontend-repo|repository: ${{ secrets.DOCKERHUB_USERNAME }}/devops-frontend # frontend-repo|" helm/devops-app/values.yaml
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add helm/devops-app/values.yaml
+          git diff --cached --quiet || git commit -m "ci: deploy image ${{ needs.build-scan-push.outputs.tag }} [skip ci]"
+          git push
